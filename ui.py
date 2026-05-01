@@ -96,6 +96,53 @@ def _detect_model_mode(model_obj):
         return "tabular", int(shape[1]), None
     return "tabular", None, None
 
+def _expected_feature_count(model_obj, scaler_obj, info_obj):
+    if hasattr(scaler_obj, "n_features_in_"):
+        return int(scaler_obj.n_features_in_)
+    mode, expected_features, _ = _detect_model_mode(model_obj)
+    if expected_features is not None:
+        return int(expected_features)
+    return len(info_obj.get("features", []))
+
+def _align_feature_vector(vec_2d: np.ndarray, target_count: int) -> np.ndarray:
+    """Pad/truncate feature matrix to match expected feature count."""
+    cur = vec_2d.shape[1]
+    if cur == target_count:
+        return vec_2d
+    if cur < target_count:
+        pad = np.zeros((vec_2d.shape[0], target_count - cur), dtype=vec_2d.dtype)
+        return np.hstack([vec_2d, pad])
+    return vec_2d[:, :target_count]
+
+def _ensure_feature_columns(df_pl: pl.DataFrame, feature_names):
+    """
+    Ensure all required feature columns exist.
+    For *_lag1 features, derive from base SMART feature by serial_number shift.
+    Remaining missing columns are filled with zeros.
+    """
+    if "serial_number" in df_pl.columns:
+        df_pl = df_pl.sort("serial_number")
+    if "date" in df_pl.columns:
+        df_pl = df_pl.sort(["serial_number", "date"]) if "serial_number" in df_pl.columns else df_pl.sort("date")
+
+    missing = [f for f in feature_names if f not in df_pl.columns]
+    lag_exprs = []
+    for col in missing:
+        if col.endswith("_lag1"):
+            base = col[:-5]
+            if base in df_pl.columns:
+                if "serial_number" in df_pl.columns:
+                    lag_exprs.append(pl.col(base).shift(1).over("serial_number").fill_null(0).alias(col))
+                else:
+                    lag_exprs.append(pl.col(base).shift(1).fill_null(0).alias(col))
+    if lag_exprs:
+        df_pl = df_pl.with_columns(lag_exprs)
+
+    still_missing = [f for f in feature_names if f not in df_pl.columns]
+    if still_missing:
+        df_pl = df_pl.with_columns([pl.lit(0.0).alias(c) for c in still_missing])
+    return df_pl
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Page Configuration & Premium Styling
 # ──────────────────────────────────────────────────────────────────────────────
@@ -276,7 +323,9 @@ if info:
             else: st.spinner("Analyzing...")
             time.sleep(1)
 
+        target_n = _expected_feature_count(model, scaler, info)
         base_vec = np.array([list(input_data.values()) + [0.0] * (len(info['features']) - 6)], dtype=np.float32)
+        base_vec = _align_feature_vector(base_vec, target_n)
         if model_mode == "sequence":
             win = expected_window or info.get("window_size", 7)
             seq = np.repeat(base_vec, win, axis=0)
@@ -287,7 +336,8 @@ if info:
             if hasattr(model, "predict_proba"):
                 prob = float(model.predict_proba(arr_scaled)[0][1])
             else:
-                prob = float(model.predict(arr_scaled, verbose=0).flatten()[0])
+                pred = model.predict(arr_scaled)
+                prob = float(np.array(pred).flatten()[0])
         st.sidebar.metric("Risk Score", f"{prob*100:.1f}%")
 
 # 4. Main Batch Analysis Section
@@ -305,6 +355,7 @@ else:
         if st.button("🚀 Process Uploaded CSV", type="primary"):
             try:
                 df = pl.read_csv(uploaded_file)
+                df = _ensure_feature_columns(df, info["features"])
                 with st.status("🧠 Analyzing SMART attributes...", expanded=True) as status:
                     model_mode, _, expected_window = _detect_model_mode(model)
                     if model_mode == "sequence":
@@ -312,7 +363,9 @@ else:
                         X_list, sns = [], []
                         for sn, group in df.group_by("serial_number"):
                             if group.height >= win:
-                                data = scaler.transform(group.tail(win).select(info['features']).to_numpy())
+                                data_raw = group.tail(win).select(info["features"]).to_numpy().astype("float32")
+                                data_raw = _align_feature_vector(data_raw, _expected_feature_count(model, scaler, info))
+                                data = scaler.transform(data_raw)
                                 X_list.append(data)
                                 sns.append(sn)
                         
@@ -322,8 +375,15 @@ else:
                         else:
                             results = pd.DataFrame()
                     else:
-                        X = scaler.transform(df.select(info['features']).to_numpy())
-                        results = pd.DataFrame({"serial_number": df["serial_number"], "failure_prob": model.predict_proba(X)[:, 1]})
+                        X_raw = df.select(info["features"]).to_numpy().astype("float32")
+                        X_raw = _align_feature_vector(X_raw, _expected_feature_count(model, scaler, info))
+                        X = scaler.transform(X_raw)
+                        if hasattr(model, "predict_proba"):
+                            preds = model.predict_proba(X)[:, 1]
+                        else:
+                            preds = np.array(model.predict(X)).flatten()
+                        sn_col = df["serial_number"] if "serial_number" in df.columns else np.arange(len(preds))
+                        results = pd.DataFrame({"serial_number": sn_col, "failure_prob": preds})
                     
                     status.update(label="Analysis Complete!", state="complete")
 
