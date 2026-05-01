@@ -1,0 +1,24 @@
+{
+    "champion_model_name": "Deep Learning (CNN-LSTM)",
+    "champion_file": "failure_prediction_dnn.keras",
+    "pr_auc": 0.07780439959269504,
+    "window_size": 7,
+    "features": [
+        "smart_1_raw",
+        "smart_5_raw",
+        "smart_7_raw",
+        "smart_187_raw",
+        "smart_197_raw",
+        "smart_9_normalized",
+        "smart_190_normalized",
+        "smart_193_normalized",
+        "smart_1_raw_lag1",
+        "smart_5_raw_lag1",
+        "smart_7_raw_lag1",
+        "smart_187_raw_lag1",
+        "smart_197_raw_lag1",
+        "smart_9_normalized_lag1",
+        "smart_190_normalized_lag1",
+        "smart_193_normalized_lag1"
+    ]
+}

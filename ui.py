@@ -1,0 +1,322 @@
+import os
+import sys
+from pathlib import Path
+
+# Silence technical noise
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# Suppress absl logs
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+except ImportError:
+    pass
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+import joblib
+import json
+import polars as pl
+import time
+import requests
+from datetime import datetime
+import tensorflow as tf
+from streamlit_lottie import st_lottie
+
+# Import classes for module shim
+import src.drive_failure_system as dfs
+
+# 1. ROBUST PATH SETTINGS
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+
+@st.cache_resource
+def load_champion_assets():
+    """Loads model, scaler, and metadata with strict path validation."""
+    try:
+        # Paths derived from BASE_DIR
+        info_path = MODELS_DIR / "best_model_info.json"
+        scaler_path = MODELS_DIR / "scaler.joblib"
+
+        # 1. Validate info file
+        if not info_path.exists():
+            st.error(f"❌ Critical Error: '{info_path.name}' missing from models/ folder.")
+            return None, None, None
+
+        with open(info_path, 'r') as f:
+            info = json.load(f)
+
+        # 2. Validate model file
+        champion_path = MODELS_DIR / info["champion_file"]
+        if not champion_path.exists():
+            st.error(f"❌ Model file not found: '{info['champion_file']}'. Check your models/ directory.")
+            return None, None, None
+
+        # 3. Validate scaler
+        if not scaler_path.exists():
+            st.error("❌ Scaler missing: 'models/scaler.joblib' is required for deployment.")
+            return None, None, None
+
+        # Load assets
+        scaler = joblib.load(scaler_path)
+        if info['champion_file'].endswith(('.h5', '.keras')):
+            model = tf.keras.models.load_model(champion_path)
+        else:
+            model = joblib.load(champion_path)
+            
+        return info, model, scaler
+    except Exception as e:
+        st.error(f"🚨 Deployment Asset Error: {e}")
+        return None, None, None
+
+# Initialize Assets
+info, model, scaler = load_champion_assets()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. Page Configuration & Premium Styling
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="ELITE Predictive Maintenance | YTA",
+    page_icon="💎",
+    layout="wide",
+)
+
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    .main { background-color: #0b0e14; color: #e0e0e0; }
+    .result-card {
+        padding: 30px;
+        border-radius: 20px;
+        background: #1a1c23;
+        border: 1px solid #30363d;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        text-align: center;
+    }
+    .glass-card {
+        background: rgba(26, 28, 35, 0.65);
+        backdrop-filter: blur(16px) saturate(180%);
+        -webkit-backdrop-filter: blur(16px) saturate(180%);
+        border-radius: 24px;
+        border: 1px solid rgba(255, 255, 255, 0.125);
+        padding: 40px;
+        text-align: center;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        position: relative;
+        overflow: hidden;
+    }
+    .pulse-high {
+        animation: pulse-red 2s infinite;
+    }
+    @keyframes pulse-red {
+        0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+        70% { box-shadow: 0 0 0 20px rgba(239, 68, 68, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+    }
+    .gauge-container {
+        position: relative;
+        width: 200px;
+        height: 200px;
+        margin: 0 auto;
+    }
+    .gauge-bg { fill: none; stroke: #30363d; stroke-width: 12; }
+    .gauge-fill {
+        fill: none;
+        stroke-width: 12;
+        stroke-linecap: round;
+        transition: stroke-dasharray 1s ease-in-out;
+        transform: rotate(-90deg);
+        transform-origin: 50% 50%;
+    }
+    .tooltip {
+        position: relative;
+        display: inline-block;
+        cursor: help;
+        margin-left: 8px;
+        color: #58a6ff;
+    }
+    .tooltip .tooltiptext {
+        visibility: hidden;
+        width: 220px;
+        background-color: #1a1c23;
+        color: #fff;
+        text-align: center;
+        border-radius: 8px;
+        padding: 10px;
+        position: absolute;
+        z-index: 1;
+        bottom: 125%;
+        left: 50%;
+        margin-left: -110px;
+        opacity: 0;
+        transition: opacity 0.3s;
+        border: 1px solid #30363d;
+        font-size: 0.8em;
+        font-weight: normal;
+        line-height: 1.4;
+    }
+    .tooltip:hover .tooltiptext {
+        visibility: visible;
+        opacity: 1;
+    }
+    .glow-low { box-shadow: 0 0 20px rgba(40, 167, 69, 0.3); border-color: #28a745 !important; }
+    .glow-med { box-shadow: 0 0 20px rgba(255, 193, 7, 0.3); border-color: #ffc107 !important; }
+    .glow-high { box-shadow: 0 0 30px rgba(220, 53, 69, 0.5); border-color: #dc3545 !important; }
+    .stMetric { background-color: #1a1c23; border: 1px solid #30363d; padding: 15px; border-radius: 12px; }
+    h1, h2, h3 { color: #58a6ff; font-weight: 800; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. Asset Loaders
+# ──────────────────────────────────────────────────────────────────────────────
+def load_lottieurl(url: str):
+    try:
+        r = requests.get(url, timeout=3)
+        return r.json() if r.status_code == 200 else None
+    except:
+        return None
+
+lottie_radar = load_lottieurl("https://assets10.lottiefiles.com/packages/lf20_m6cu9atn.json")
+
+def render_premium_risk_card(prob, sn):
+    percent = prob * 100
+    if percent <= 20:
+        color = "#10b981"  # Emerald Green
+        status = "Rock Solid"
+        glow = "rgba(16, 185, 129, 0.5)"
+        cls = ""
+    elif percent <= 60:
+        color = "#f59e0b"  # Sunray Yellow
+        status = "Cautionary"
+        glow = "rgba(245, 158, 11, 0.5)"
+        cls = ""
+    else:
+        color = "#ef4444"  # Vivid Crimson
+        status = "Investigate Immediately"
+        glow = "rgba(239, 68, 68, 0.5)"
+        cls = "pulse-high"
+    
+    # SVG math for circular progress
+    radius = 80
+    circumference = 2 * 3.14159 * radius
+    offset = circumference - (prob * circumference)
+    
+    html = f"""
+    <div class="glass-card {cls}" style="border-top: 4px solid {color};">
+        <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 15px;">
+            <span style="color: {color}; font-weight: 800; font-size: 1.2em; text-transform: uppercase; letter-spacing: 2px;">Risk Analysis</span>
+            <div class="tooltip">ⓘ
+                <span class="tooltiptext">This score represents the probability of failure within the next 30 days based on your drive's temporal patterns.</span>
+            </div>
+        </div>
+        <div class="gauge-container">
+            <svg viewBox="0 0 200 200" width="200" height="200">
+                <circle class="gauge-bg" cx="100" cy="100" r="{radius}" />
+                <circle class="gauge-fill" cx="100" cy="100" r="{radius}" 
+                        style="stroke: {color}; stroke-dasharray: {circumference}; stroke-dashoffset: {offset}; 
+                                filter: drop-shadow(0 0 8px {glow});" />
+                <text x="50%" y="50%" text-anchor="middle" dy=".3em" 
+                      style="font-size: 2.5em; font-weight: 800; fill: #ffffff; font-family: 'Inter', sans-serif;">
+                    {percent:.1f}%
+                </text>
+            </svg>
+        </div>
+        <div style="margin-top: 20px;">
+            <p style="color: #8b949e; margin: 0; font-size: 0.9em;">Drive: {sn}</p>
+            <h3 style="color: {color}; margin: 5px 0 0 0; font-size: 1.4em;">Status: {status}</h3>
+        </div>
+    </div>
+    """
+    return html
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. Sidebar - Elite Control
+# ──────────────────────────────────────────────────────────────────────────────
+st.sidebar.title("💎 ELITE HUB")
+if info:
+    st.sidebar.success(f"Champion: {info['champion_model_name']}")
+    input_data = {}
+    for feat in info['features'][:6]:
+        input_data[feat] = st.sidebar.number_input(f"{feat}", value=100.0)
+    if st.sidebar.button("Run Diagnostic"):
+        with st.sidebar:
+            if lottie_radar: st_lottie(lottie_radar, height=100)
+            else: st.spinner("Analyzing...")
+            time.sleep(1)
+        # Sequence logic
+        if info['window_size'] > 1:
+            seq = np.repeat(np.array([list(input_data.values()) + [0.0]*(len(info['features'])-6)]), info['window_size'], axis=0)
+            seq_scaled = scaler.transform(seq).reshape(1, info['window_size'], -1)
+            prob = model.predict(seq_scaled, verbose=0)[0][0]
+        else:
+            arr = np.array([list(input_data.values()) + [0.0]*(len(info['features'])-6)])
+            arr_scaled = scaler.transform(arr)
+            prob = model.predict_proba(arr_scaled)[0][1]
+        st.sidebar.metric("Risk Score", f"{prob*100:.1f}%")
+
+# 4. Main Batch Analysis Section
+st.title("🛡️ Predictive Maintenance Intelligence")
+
+if info is None:
+    st.warning("⚠️ Application is in 'Safe Mode' because model assets are missing. See error messages above.")
+else:
+    uploaded_file = st.file_uploader("Drop Fleet SMART Logs (.csv)", type=["csv"])
+
+    if uploaded_file:
+        st.info("📂 File uploaded successfully. Click the button below to start AI analysis.")
+        
+        # Explicit Process Button
+        if st.button("🚀 Process Uploaded CSV", type="primary"):
+            try:
+                df = pl.read_csv(uploaded_file)
+                with st.status("🧠 Analyzing SMART attributes...", expanded=True) as status:
+                    # Logic for Windowed vs Tabular models
+                    if info.get('window_size', 1) > 1:
+                        X_list, sns = [], []
+                        for sn, group in df.group_by("serial_number"):
+                            if group.height >= info['window_size']:
+                                data = scaler.transform(group.tail(info['window_size']).select(info['features']).to_numpy())
+                                X_list.append(data)
+                                sns.append(sn)
+                        
+                        if X_list:
+                            preds = model.predict(np.array(X_list), verbose=0).flatten()
+                            results = pd.DataFrame({"serial_number": sns, "failure_prob": preds})
+                        else:
+                            results = pd.DataFrame()
+                    else:
+                        X = scaler.transform(df.select(info['features']).to_numpy())
+                        results = pd.DataFrame({"serial_number": df["serial_number"], "failure_prob": model.predict_proba(X)[:, 1]})
+                    
+                    status.update(label="Analysis Complete!", state="complete")
+
+                if not results.empty:
+                    top_drive = results.sort_values("failure_prob", ascending=False).iloc[0]
+                    risk_val = top_drive['failure_prob']
+                    
+                    c1, c2 = st.columns([1.5, 2])
+                    with c1:
+                        st.markdown(render_premium_risk_card(risk_val, top_drive['serial_number']), unsafe_allow_html=True)
+                    with c2:
+                        msg = "🚨 CRITICAL ALERT" if risk_val > 0.6 else "⚠️ Precaution Advised" if risk_val > 0.2 else "✅ System Healthy"
+                        st.markdown(f"<div style='padding-top:40px;'><h1 style='font-size:3.5em; line-height:1.1;'>{msg}</h1><p style='font-size:1.2em; color:#8b949e;'>Elite AI Pipeline has identified potential anomalies in the drive's temporal behavior.</p></div>", unsafe_allow_html=True)
+                        if risk_val > 0.6: st.error("⚠️ CRITICAL: Immediate replacement recommended to prevent data loss.")
+                        elif risk_val < 0.2: st.balloons()
+
+                    st.success(f"Analyzed {len(results)} unique drives.")
+                    st.dataframe(results.sort_values("failure_prob", ascending=False), use_container_width=True)
+                else:
+                    st.warning("No valid sequences found in the CSV for the current model requirements.")
+
+            except Exception as e:
+                st.error(f"Processing Error: {e}")
+    else:
+        st.write("Please upload a CSV file to begin.")
+
+st.markdown("<br><center><p style='color: grey;'>💎 YTA Elite Intelligence Hub</p></center>", unsafe_allow_html=True)
