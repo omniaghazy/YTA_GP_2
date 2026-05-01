@@ -76,6 +76,26 @@ def load_champion_assets():
 # Initialize Assets
 info, model, scaler = load_champion_assets()
 
+def _detect_model_mode(model_obj):
+    """Return ('sequence'|'tabular', expected_feature_count, expected_window_size_or_none)."""
+    # Non-keras models are treated as tabular sklearn-like estimators.
+    if not hasattr(model_obj, "input_shape"):
+        return "tabular", None, None
+
+    shape = model_obj.input_shape
+    # Keras may return list for multi-input models; we only support single-input here.
+    if isinstance(shape, list):
+        shape = shape[0]
+
+    # Typical shapes:
+    # Tabular DNN: (None, n_features)
+    # Sequence model: (None, window_size, n_features)
+    if len(shape) == 3:
+        return "sequence", int(shape[2]), int(shape[1])
+    if len(shape) == 2:
+        return "tabular", int(shape[1]), None
+    return "tabular", None, None
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Page Configuration & Premium Styling
 # ──────────────────────────────────────────────────────────────────────────────
@@ -244,20 +264,30 @@ if info:
     input_data = {}
     for feat in info['features'][:6]:
         input_data[feat] = st.sidebar.number_input(f"{feat}", value=100.0)
+    model_mode, expected_features, expected_window = _detect_model_mode(model)
+    if model_mode == "tabular" and info.get("window_size", 1) > 1:
+        st.sidebar.warning("Model metadata says sequence, but loaded model is tabular. Using tabular mode.")
+    if model_mode == "sequence" and info.get("window_size", 1) <= 1:
+        st.sidebar.warning("Model metadata says tabular, but loaded model is sequence. Using sequence mode.")
+
     if st.sidebar.button("Run Diagnostic"):
         with st.sidebar:
             if lottie_radar: st_lottie(lottie_radar, height=100)
             else: st.spinner("Analyzing...")
             time.sleep(1)
-        # Sequence logic
-        if info['window_size'] > 1:
-            seq = np.repeat(np.array([list(input_data.values()) + [0.0]*(len(info['features'])-6)]), info['window_size'], axis=0)
-            seq_scaled = scaler.transform(seq).reshape(1, info['window_size'], -1)
-            prob = model.predict(seq_scaled, verbose=0)[0][0]
+
+        base_vec = np.array([list(input_data.values()) + [0.0] * (len(info['features']) - 6)], dtype=np.float32)
+        if model_mode == "sequence":
+            win = expected_window or info.get("window_size", 7)
+            seq = np.repeat(base_vec, win, axis=0)
+            seq_scaled = scaler.transform(seq).reshape(1, win, -1)
+            prob = float(model.predict(seq_scaled, verbose=0).flatten()[0])
         else:
-            arr = np.array([list(input_data.values()) + [0.0]*(len(info['features'])-6)])
-            arr_scaled = scaler.transform(arr)
-            prob = model.predict_proba(arr_scaled)[0][1]
+            arr_scaled = scaler.transform(base_vec)
+            if hasattr(model, "predict_proba"):
+                prob = float(model.predict_proba(arr_scaled)[0][1])
+            else:
+                prob = float(model.predict(arr_scaled, verbose=0).flatten()[0])
         st.sidebar.metric("Risk Score", f"{prob*100:.1f}%")
 
 # 4. Main Batch Analysis Section
@@ -276,12 +306,13 @@ else:
             try:
                 df = pl.read_csv(uploaded_file)
                 with st.status("🧠 Analyzing SMART attributes...", expanded=True) as status:
-                    # Logic for Windowed vs Tabular models
-                    if info.get('window_size', 1) > 1:
+                    model_mode, _, expected_window = _detect_model_mode(model)
+                    if model_mode == "sequence":
+                        win = expected_window or info.get("window_size", 7)
                         X_list, sns = [], []
                         for sn, group in df.group_by("serial_number"):
-                            if group.height >= info['window_size']:
-                                data = scaler.transform(group.tail(info['window_size']).select(info['features']).to_numpy())
+                            if group.height >= win:
+                                data = scaler.transform(group.tail(win).select(info['features']).to_numpy())
                                 X_list.append(data)
                                 sns.append(sn)
                         
