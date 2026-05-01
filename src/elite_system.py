@@ -81,6 +81,8 @@ class EliteConfig:
 
     # Optuna
     n_trials: int = 5 # Set to 5 for speed in this turn, increase for production
+    recall_target: float = 0.90
+    recall_priority_beta: float = 2.0
     
     # Feature Engineering
     lag_days: int = 1
@@ -217,6 +219,18 @@ class ElitePipeline:
         self.preprocessor = ElitePreprocessor(cfg)
         self.optimizer = EliteOptimizer(cfg)
 
+    def _choose_threshold_for_recall(self, y_true, y_prob):
+        prec, rec, thr = precision_recall_curve(y_true, y_prob)
+        thr = np.append(thr, 1.0)
+        beta2 = self.cfg.recall_priority_beta ** 2
+        fbeta = (1 + beta2) * prec * rec / (beta2 * prec + rec + 1e-12)
+        eligible = np.where(rec >= self.cfg.recall_target)[0]
+        if len(eligible):
+            idx = eligible[np.argmax(fbeta[eligible])]
+        else:
+            idx = int(np.argmax(fbeta))
+        return float(thr[idx]), float(prec[idx]), float(rec[idx]), float(fbeta[idx])
+
     def run(self):
         log.info("🚀 Starting ELITE Optimization Pipeline...")
         
@@ -254,12 +268,24 @@ class ElitePipeline:
         log.info(f"Best DL Params: {best_params}")
         
         final_model = build_hybrid_model((X_train.shape[1], X_train.shape[2]), best_params)
-        final_model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=50, batch_size=128, verbose=1)
+        pos = max(float(np.sum(y_train == 1)), 1.0)
+        neg = max(float(np.sum(y_train == 0)), 1.0)
+        class_weight = {0: 1.0, 1: neg / pos}
+        final_model.fit(
+            X_train,
+            y_train,
+            validation_data=(X_val, y_val),
+            epochs=50,
+            batch_size=128,
+            verbose=1,
+            class_weight=class_weight,
+        )
         
         # Save
         final_model.save(f"{self.cfg.artifacts_dir}/best_deep_model.h5")
         dl_preds = final_model.predict(X_test, verbose=0).flatten()
         dl_score = average_precision_score(y_test, dl_preds)
+        dl_thr, dl_pre, dl_rec, dl_f2 = self._choose_threshold_for_recall(y_test, dl_preds)
         
         # ML Candidate (Tabular + Lags)
         ml_features = [c for c in train_df.columns if c.startswith("smart_")]
@@ -269,24 +295,38 @@ class ElitePipeline:
         
         log.info("Tuning ML Stacking Candidate...")
         ml_best_params = self.optimizer.tune_ml(X_train_ml, y_train_ml, X_val_ml, y_val_ml)
+        imbalance = max(float(np.sum(y_train_ml == 0)) / max(float(np.sum(y_train_ml == 1)), 1.0), 1.0)
+        ml_best_params["scale_pos_weight"] = imbalance
         ml_model = XGBClassifier(**ml_best_params, random_state=42)
         ml_model.fit(X_train_ml, y_train_ml)
         joblib.dump(ml_model, f"{self.cfg.artifacts_dir}/best_ml_model.joblib")
+        ml_model.save_model(f"{self.cfg.artifacts_dir}/best_ml_model.json")
         
         ml_preds = ml_model.predict_proba(X_test_ml)[:, 1]
         ml_score = average_precision_score(y_test_ml, ml_preds)
+        ml_thr, ml_pre, ml_rec, ml_f2 = self._choose_threshold_for_recall(y_test_ml, ml_preds)
         
-        # CHAMPION SELECTION
-        champion = "Deep Learning (CNN-LSTM)" if dl_score >= ml_score else "ML Stacking (XGBoost)"
-        log.info(f"🏆 Champion Model: {champion} (PR-AUC: {max(dl_score, ml_score):.4f})")
+        # CHAMPION SELECTION (Recall first, PR-AUC as tiebreaker)
+        if dl_rec > ml_rec:
+            champion = "Deep Learning (CNN-LSTM)"
+        elif ml_rec > dl_rec:
+            champion = "ML Stacking (XGBoost)"
+        else:
+            champion = "Deep Learning (CNN-LSTM)" if dl_score >= ml_score else "ML Stacking (XGBoost)"
+        log.info(
+            f"Champion: {champion} | DL recall={dl_rec:.4f}, ML recall={ml_rec:.4f} | "
+            f"DL PR-AUC={dl_score:.4f}, ML PR-AUC={ml_score:.4f}"
+        )
         
         # Info
         info = {
             "champion_model_name": champion,
-            "champion_file": "best_deep_model.h5" if dl_score >= ml_score else "best_ml_model.joblib",
+            "champion_file": "best_deep_model.h5" if champion == "Deep Learning (CNN-LSTM)" else "best_ml_model.json",
             "pr_auc": float(max(dl_score, ml_score)),
-            "window_size": self.cfg.window_size if dl_score >= ml_score else 1,
-            "features": ml_features
+            "window_size": self.cfg.window_size if champion == "Deep Learning (CNN-LSTM)" else 1,
+            "features": ml_features,
+            "recall_target": self.cfg.recall_target,
+            "threshold": dl_thr if champion == "Deep Learning (CNN-LSTM)" else ml_thr
         }
         with open(self.cfg.best_model_info, 'w') as f:
             json.dump(info, f, indent=4)

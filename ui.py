@@ -25,6 +25,7 @@ import time
 import requests
 from datetime import datetime
 import tensorflow as tf
+from xgboost import XGBClassifier
 from streamlit_lottie import st_lottie
 
 # Import classes for module shim
@@ -65,9 +66,27 @@ def load_champion_assets():
         scaler = joblib.load(scaler_path)
         if info['champion_file'].endswith(('.h5', '.keras')):
             model = tf.keras.models.load_model(champion_path)
+        elif info['champion_file'].endswith('.json'):
+            model = XGBClassifier()
+            model.load_model(str(champion_path))
         else:
             model = joblib.load(champion_path)
-            
+        
+        # Compatibility guard (prevents runtime shape crashes).
+        scaler_n = int(getattr(scaler, "n_features_in_", 0) or 0)
+        model_shape = getattr(model, "input_shape", None)
+        if isinstance(model_shape, list):
+            model_shape = model_shape[0]
+        if model_shape is not None and len(model_shape) == 2 and model_shape[1] is not None and scaler_n:
+            model_n = int(model_shape[1])
+            if model_n != scaler_n:
+                st.error(
+                    f"🚨 Artifact mismatch: model expects {model_n} features, "
+                    f"but scaler expects {scaler_n}. "
+                    "Upload matching artifacts from the same training run."
+                )
+                return info, None, None
+
         return info, model, scaler
     except Exception as e:
         st.error(f"🚨 Deployment Asset Error: {e}")
@@ -269,10 +288,13 @@ def render_premium_risk_card(prob, sn):
         glow = "rgba(239, 68, 68, 0.5)"
         cls = "pulse-high"
     
-    # SVG math for circular progress
-    radius = 80
-    circumference = 2 * 3.14159 * radius
-    offset = circumference - (prob * circumference)
+    # Clock-style dial: map 0-100% across the top semicircle (180deg -> 0deg)
+    p = max(0.0, min(1.0, float(prob)))
+    angle_deg = 180 - (180 * p)
+    angle_rad = np.deg2rad(angle_deg)
+    cx, cy, r = 110, 120, 80
+    x2 = cx + (r - 16) * np.cos(angle_rad)
+    y2 = cy + (r - 16) * np.sin(angle_rad)
     
     html = f"""
     <div class="glass-card {cls}" style="border-top: 4px solid {color};">
@@ -282,16 +304,17 @@ def render_premium_risk_card(prob, sn):
                 <span class="tooltiptext">This score represents the probability of failure within the next 30 days based on your drive's temporal patterns.</span>
             </div>
         </div>
-        <div class="gauge-container">
-            <svg viewBox="0 0 200 200" width="200" height="200">
-                <circle class="gauge-bg" cx="100" cy="100" r="{radius}" />
-                <circle class="gauge-fill" cx="100" cy="100" r="{radius}" 
-                        style="stroke: {color}; stroke-dasharray: {circumference}; stroke-dashoffset: {offset}; 
-                                filter: drop-shadow(0 0 8px {glow});" />
-                <text x="50%" y="50%" text-anchor="middle" dy=".3em" 
-                      style="font-size: 2.5em; font-weight: 800; fill: #ffffff; font-family: 'Inter', sans-serif;">
+        <div style="display:flex; justify-content:center; margin: 8px 0 10px 0;">
+            <svg viewBox="0 0 220 190" width="220" height="190">
+                <path d="M 40 120 A 70 70 0 0 1 180 120" fill="none" stroke="#30363d" stroke-width="12" stroke-linecap="round"/>
+                <line x1="{cx}" y1="{cy}" x2="{x2:.2f}" y2="{y2:.2f}" stroke="{color}" stroke-width="6" stroke-linecap="round"
+                      style="filter: drop-shadow(0 0 6px {glow});"/>
+                <circle cx="{cx}" cy="{cy}" r="8" fill="{color}"/>
+                <text x="110" y="168" text-anchor="middle" style="font-size: 2.0em; font-weight: 800; fill: #ffffff; font-family: 'Inter', sans-serif;">
                     {percent:.1f}%
                 </text>
+                <text x="40" y="138" text-anchor="middle" style="font-size: 0.8em; fill: #8b949e;">0</text>
+                <text x="180" y="138" text-anchor="middle" style="font-size: 0.8em; fill: #8b949e;">100</text>
             </svg>
         </div>
         <div style="margin-top: 20px;">
@@ -306,7 +329,7 @@ def render_premium_risk_card(prob, sn):
 # 3. Sidebar - Elite Control
 # ──────────────────────────────────────────────────────────────────────────────
 st.sidebar.title("💎 ELITE HUB")
-if info:
+if info and model is not None and scaler is not None:
     st.sidebar.success(f"Champion: {info['champion_model_name']}")
     input_data = {}
     for feat in info['features'][:6]:
@@ -343,7 +366,7 @@ if info:
 # 4. Main Batch Analysis Section
 st.title("🛡️ Predictive Maintenance Intelligence")
 
-if info is None:
+if info is None or model is None or scaler is None:
     st.warning("⚠️ Application is in 'Safe Mode' because model assets are missing. See error messages above.")
 else:
     uploaded_file = st.file_uploader("Drop Fleet SMART Logs (.csv)", type=["csv"])
@@ -355,6 +378,10 @@ else:
         if st.button("🚀 Process Uploaded CSV", type="primary"):
             try:
                 df = pl.read_csv(uploaded_file)
+                if "date" in df.columns:
+                    df = df.with_columns(pl.col("date").str.to_date(strict=False))
+                if "serial_number" in df.columns and "date" in df.columns:
+                    df = df.sort(["serial_number", "date"])
                 df = _ensure_feature_columns(df, info["features"])
                 with st.status("🧠 Analyzing SMART attributes...", expanded=True) as status:
                     model_mode, _, expected_window = _detect_model_mode(model)
@@ -375,19 +402,41 @@ else:
                         else:
                             results = pd.DataFrame()
                     else:
-                        X_raw = df.select(info["features"]).to_numpy().astype("float32")
+                        if "serial_number" in df.columns:
+                            if "date" in df.columns:
+                                latest = df.group_by("serial_number").tail(1)
+                            else:
+                                latest = df.group_by("serial_number").head(1)
+                        else:
+                            latest = df
+
+                        X_raw = latest.select(info["features"]).to_numpy().astype("float32")
                         X_raw = _align_feature_vector(X_raw, _expected_feature_count(model, scaler, info))
                         X = scaler.transform(X_raw)
                         if hasattr(model, "predict_proba"):
                             preds = model.predict_proba(X)[:, 1]
                         else:
                             preds = np.array(model.predict(X)).flatten()
-                        sn_col = df["serial_number"] if "serial_number" in df.columns else np.arange(len(preds))
+                        sn_col = latest["serial_number"] if "serial_number" in latest.columns else np.arange(len(preds))
                         results = pd.DataFrame({"serial_number": sn_col, "failure_prob": preds})
                     
+                    feat_np = df.select(info["features"]).to_numpy()
+                    feat_std = float(np.nanmean(np.std(feat_np, axis=0))) if feat_np.size else 0.0
+                    drive_count = int(df["serial_number"].n_unique()) if "serial_number" in df.columns else len(df)
+                    st.caption(
+                        f"Debug | rows={len(df):,} | drives={drive_count:,} | "
+                        f"mode={model_mode} | mean_feature_std={feat_std:.4f}"
+                    )
+
                     status.update(label="Analysis Complete!", state="complete")
 
                 if not results.empty:
+                    results = (
+                        results.groupby("serial_number", as_index=False)["failure_prob"]
+                        .max()
+                        .sort_values("failure_prob", ascending=False)
+                        .reset_index(drop=True)
+                    )
                     top_drive = results.sort_values("failure_prob", ascending=False).iloc[0]
                     risk_val = top_drive['failure_prob']
                     

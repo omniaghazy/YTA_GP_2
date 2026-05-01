@@ -1,8 +1,8 @@
 {
-    "champion_model_name": "Deep Learning (CNN-LSTM)",
-    "champion_file": "failure_prediction_dnn.keras",
-    "pr_auc": 0.07780439959269504,
-    "window_size": 7,
+    "champion_model_name": "ML Stacking (XGBoost)",
+    "champion_file": "best_ml_model.json",
+    "pr_auc": 0.056104813459119746,
+    "window_size": 1,
     "features": [
         "smart_1_raw",
         "smart_5_raw",
@@ -20,5 +20,7 @@
         "smart_9_normalized_lag1",
         "smart_190_normalized_lag1",
         "smart_193_normalized_lag1"
-    ]
+    ],
+    "recall_target": 0.9,
+    "threshold": 0.04130348935723305
 }
